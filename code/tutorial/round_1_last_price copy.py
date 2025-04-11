@@ -27,8 +27,8 @@ PARAMS = {
         "take_width": 1,
         "clear_width": 0,
         "prevent_adverse": True,
-        "adverse_volume": 15,
-        "reversion_beta": -0.489,
+        "adverse_volume": 20,
+        "reversion_ar": [-0.75,-0.5533,-0.395, -0.244 -0.104],
         "disregard_edge": 1,
         "join_edge": 0,
         "default_edge": 1,
@@ -37,8 +37,8 @@ PARAMS = {
         "take_width": 1,
         "clear_width": 0,
         "prevent_adverse": True,
-        "adverse_volume": 15,
-        "reversion_beta": -0.2145,
+        "adverse_volume": 20,
+        "reversion_ar": [-0.22,-0.038, -0.009, -0.0004, -0.00041],
         "disregard_edge": 1,
         "join_edge": 0,
         "default_edge": 1,
@@ -189,49 +189,86 @@ class Trader:
                 buy_order_volume += abs(sent_quantity)
 
         return buy_order_volume, sell_order_volume
-    def squid_fair_value(self, product: str, order_depth: OrderDepth, traderObject) -> float:
+    def squid_fair_value(self, product: str, order_depth: OrderDepth, market_state, timestamp, traderObject) -> float:
         if len(order_depth.sell_orders) != 0 and len(order_depth.buy_orders) != 0:
             best_ask = min(order_depth.sell_orders.keys())
             best_bid = max(order_depth.buy_orders.keys())
             filtered_ask = [
                 price
                 for price in order_depth.sell_orders.keys()
-                if abs(order_depth.sell_orders[price])
-                >= self.params[product]["adverse_volume"]
+                if abs(order_depth.sell_orders[price]) >= self.params[product]["adverse_volume"]
             ]
             filtered_bid = [
                 price
                 for price in order_depth.buy_orders.keys()
-                if abs(order_depth.buy_orders[price])
-                >= self.params[product]["adverse_volume"]
+                if abs(order_depth.buy_orders[price]) >= self.params[product]["adverse_volume"]
             ]
             mm_ask = min(filtered_ask) if len(filtered_ask) > 0 else None
             mm_bid = max(filtered_bid) if len(filtered_bid) > 0 else None
-            if mm_ask == None or mm_bid == None:
-                if traderObject.get(f"{product}_last_price", None) == None:
+            
+            # Determine the mid price from filtered data or fallback to best bid/ask
+            if mm_ask is None or mm_bid is None:
+                if traderObject.get(f"{product}_last_price", None) is None:
                     mmmid_price = (best_ask + best_bid) / 2
                 else:
                     mmmid_price = traderObject[f"{product}_last_price"]
             else:
                 mmmid_price = (mm_ask + mm_bid) / 2
-
-
-
-
-
-
-            if traderObject.get(f"{product}_last_price", None) != None:
-                last_price = traderObject[f"{product}_last_price"] = mmmid_price
-                last_returns = (mmmid_price - last_price) / last_price
-                pred_returns = (
-                    last_returns * self.params[product]["reversion_beta"]
-                )
+            try:   
+                trades = market_state.get(product, [])
+                if trades:
+                    max_timestamp = max(t.timestamp for t in trades)
+                    recent_trades = [t for t in trades if t.timestamp == max_timestamp]
+                    avg_price = sum(t.price for t in recent_trades) / len(recent_trades)  
+            except AttributeError:
+                # Handle the case where market_state is not a list of trades
+                avg_price = mmmid_price       
+            # Gather previous fill prices for this product from traderObject
+            found_price = None
+            ar_coef = None
+            # Get list of AR coefficients if provided, otherwise fallback to reversion_beta for all intervals.
+            # Expecting a list of at least 5 coefficients corresponding to intervals [100,200,300,400,500]
+            ar_coefs = self.params[product].get("reversion_ar", None)
+            for interval in [100, 200, 300, 400, 500]:
+                lower_bound = timestamp - interval
+                candidate = None
+                for key, price in traderObject.items():
+                    if key.startswith(f"{product}_") and key.endswith("_last_fill_price"):
+                        try:
+                            ts_str = key[len(product)+1:-len("_last_fill_price")]
+                            ts_val = float(ts_str)
+                        except ValueError:
+                            continue
+                        # Only consider entries with timestamp within [timestamp - interval, timestamp)
+                        if lower_bound <= ts_val < timestamp:
+                            if candidate is None or ts_val > candidate[0]:
+                                candidate = (ts_val, price)
+                if candidate is not None:
+                    found_price = candidate[1]
+                    # Determine the AR coefficient index (1-indexed by interval/100, then convert to 0-index)
+                    coef_index = (interval // 100) - 1
+                    if ar_coefs is not None and coef_index < len(ar_coefs):
+                        ar_coef = ar_coefs[coef_index]
+                    else:
+                        ar_coef = 0
+                    break
+            if found_price is not None:
+                last_return = (avg_price - found_price) / found_price
+                pred_returns = last_return * ar_coef
                 fair = mmmid_price + (mmmid_price * pred_returns)
             else:
                 fair = mmmid_price
-            traderObject["starfruit_last_price"] = mmmid_price
+
+            # Update traderObject with the current fill price using the current timestamp
+            traderObject[f"{product}_{timestamp}_last_fill_price"] = mmmid_price
+            try:
+                traderObject[f"{product}_{max_timestamp}_last_fill_price"] = avg_price
+            except UnboundLocalError:
+                pass
+
             return fair
         return None
+
 
     def take_orders(
         self,
@@ -403,11 +440,14 @@ class Trader:
                 if Product.KELP in state.position
                 else 0
             )
-            
-            kelp_fair_value = self.get_fair_mid(
-                state.order_depths[Product.KELP],
+            kelp_trades = state.market_trades.get(Product.KELP, [])
+
+            kelp_fair_value = self.squid_fair_value(
                 Product.KELP,
-                traderObject,
+                state.order_depths[Product.KELP],
+                kelp_trades,
+                state.timestamp,
+                traderObject
             )
             
             kelp_take_orders, buy_order_volume, sell_order_volume = (
@@ -453,11 +493,14 @@ class Trader:
                 if Product.SQUID_INK in state.position
                 else 0
             )
-            
-            squid_ink_fair_value = self.get_fair_mid(
-                state.order_depths[Product.SQUID_INK],
+            squid_trades= state.market_trades.get(Product.SQUID_INK, [])
+
+            squid_ink_fair_value = self.squid_fair_value(
                 Product.SQUID_INK,
-                traderObject,
+                state.order_depths[Product.SQUID_INK],
+                squid_trades,               
+                state.timestamp,
+                traderObject
             )
             
             squid_take_orders, buy_order_volume, sell_order_volume = (

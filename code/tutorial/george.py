@@ -38,7 +38,8 @@ PARAMS = {
         "clear_width": 0,
         "prevent_adverse": True,
         "adverse_volume": 15,
-        "reversion_beta": -0.2145,
+        "ema_alpha": 0.2,        # how fast the EMA updates
+        "reversion_beta": -0.3,   # how much to pull back toward EMA
         "disregard_edge": 1,
         "join_edge": 0,
         "default_edge": 1,
@@ -75,6 +76,9 @@ class Trader:
                         mid_price = (min(order_depth.sell_orders.keys()) + max(order_depth.buy_orders.keys())) / 2
                         
             return mid_price
+        
+        # Default return value if no conditions are met
+        return 0.0
         
     def take_best_orders(
         self,
@@ -189,49 +193,43 @@ class Trader:
                 buy_order_volume += abs(sent_quantity)
 
         return buy_order_volume, sell_order_volume
+
     def squid_fair_value(self, product: str, order_depth: OrderDepth, traderObject) -> float:
         if len(order_depth.sell_orders) != 0 and len(order_depth.buy_orders) != 0:
             best_ask = min(order_depth.sell_orders.keys())
             best_bid = max(order_depth.buy_orders.keys())
+
             filtered_ask = [
-                price
-                for price in order_depth.sell_orders.keys()
-                if abs(order_depth.sell_orders[price])
-                >= self.params[product]["adverse_volume"]
+                price for price in order_depth.sell_orders.keys()
+                if abs(order_depth.sell_orders[price]) >= self.params[product]["adverse_volume"]
             ]
             filtered_bid = [
-                price
-                for price in order_depth.buy_orders.keys()
-                if abs(order_depth.buy_orders[price])
-                >= self.params[product]["adverse_volume"]
+                price for price in order_depth.buy_orders.keys()
+                if abs(order_depth.buy_orders[price]) >= self.params[product]["adverse_volume"]
             ]
-            mm_ask = min(filtered_ask) if len(filtered_ask) > 0 else None
-            mm_bid = max(filtered_bid) if len(filtered_bid) > 0 else None
-            if mm_ask == None or mm_bid == None:
-                if traderObject.get(f"{product}_last_price", None) == None:
-                    mmmid_price = (best_ask + best_bid) / 2
-                else:
-                    mmmid_price = traderObject[f"{product}_last_price"]
+
+            mm_ask = min(filtered_ask) if filtered_ask else None
+            mm_bid = max(filtered_bid) if filtered_bid else None
+
+            current_mid = (mm_ask + mm_bid) / 2 if mm_ask and mm_bid else (best_ask + best_bid) / 2
+
+            ema_key = f"{product}_ema"
+            alpha = self.params[product].get("ema_alpha", 0.2)
+            if ema_key in traderObject:
+                ema = alpha * current_mid + (1 - alpha) * traderObject[ema_key]
             else:
-                mmmid_price = (mm_ask + mm_bid) / 2
+                ema = current_mid
 
+            traderObject[ema_key] = ema
 
+            # Mean reversion adjustment
+            beta = self.params[product].get("reversion_beta", 0)
+            fair_value = ema + beta * (current_mid - ema)
 
+            return fair_value
 
-
-
-            if traderObject.get(f"{product}_last_price", None) != None:
-                last_price = traderObject[f"{product}_last_price"] = mmmid_price
-                last_returns = (mmmid_price - last_price) / last_price
-                pred_returns = (
-                    last_returns * self.params[product]["reversion_beta"]
-                )
-                fair = mmmid_price + (mmmid_price * pred_returns)
-            else:
-                fair = mmmid_price
-            traderObject["starfruit_last_price"] = mmmid_price
-            return fair
         return None
+
 
     def take_orders(
         self,
@@ -404,9 +402,9 @@ class Trader:
                 else 0
             )
             
-            kelp_fair_value = self.get_fair_mid(
-                state.order_depths[Product.KELP],
+            kelp_fair_value = self.squid_fair_value(
                 Product.KELP,
+                state.order_depths[Product.KELP],
                 traderObject,
             )
             
@@ -454,9 +452,9 @@ class Trader:
                 else 0
             )
             
-            squid_ink_fair_value = self.get_fair_mid(
-                state.order_depths[Product.SQUID_INK],
+            squid_ink_fair_value = self.squid_fair_value(
                 Product.SQUID_INK,
+                state.order_depths[Product.SQUID_INK],
                 traderObject,
             )
             

@@ -51,16 +51,22 @@ class Trader:
         if params is None:
             params = PARAMS
         self.params = params
+        self.squid_ink_prices = []
+        self.window = 3
+        self.entry_threshold = 1.5
+        self.exit_threshold = 0.5
+        self.zscore_position_limit = 20
+
 
         self.LIMIT = {Product.RAINFOREST_RESIN: 50, Product.KELP: 50, Product.SQUID_INK: 50}
-         
+
     def get_fair_mid(
         self,
         order_depth: OrderDepth,
         product: str,
         traderObject: dict,
     ) -> float:
-        
+
         if len(order_depth.sell_orders) != 0 and len(order_depth.buy_orders) != 0:
             # Look for a matching price level across all sell and buy orders
             for price_ask, volume in order_depth.sell_orders.items():
@@ -73,9 +79,16 @@ class Trader:
                     else: 
                         # If volumes don't match, use the average of the best ask and best bid
                         mid_price = (min(order_depth.sell_orders.keys()) + max(order_depth.buy_orders.keys())) / 2
-                        
+
             return mid_price
-        
+
+    def compute_zscore(self, prices, window):
+        if len(prices) < window:
+            return 0
+        mean = np.mean(prices[-window:])
+        std = np.std(prices[-window:])
+        return (prices[-1] - mean) / std if std > 0 else 0    
+
     def take_best_orders(
         self,
         product: str,
@@ -196,42 +209,39 @@ class Trader:
             filtered_ask = [
                 price
                 for price in order_depth.sell_orders.keys()
-                if abs(order_depth.sell_orders[price])
-                >= self.params[product]["adverse_volume"]
+                if abs(order_depth.sell_orders[price]) >= self.params[product]["adverse_volume"]
             ]
             filtered_bid = [
                 price
                 for price in order_depth.buy_orders.keys()
-                if abs(order_depth.buy_orders[price])
-                >= self.params[product]["adverse_volume"]
+                if abs(order_depth.buy_orders[price]) >= self.params[product]["adverse_volume"]
             ]
             mm_ask = min(filtered_ask) if len(filtered_ask) > 0 else None
             mm_bid = max(filtered_bid) if len(filtered_bid) > 0 else None
-            if mm_ask == None or mm_bid == None:
-                if traderObject.get(f"{product}_last_price", None) == None:
+
+            # Determine the mid price from filtered data or fallback to best bid/ask
+            if mm_ask is None or mm_bid is None:
+                if traderObject.get(f"{product}_last_price", None) is None:
                     mmmid_price = (best_ask + best_bid) / 2
                 else:
                     mmmid_price = traderObject[f"{product}_last_price"]
             else:
                 mmmid_price = (mm_ask + mm_bid) / 2
 
-
-
-
-
-
-            if traderObject.get(f"{product}_last_price", None) != None:
-                last_price = traderObject[f"{product}_last_price"] = mmmid_price
+            # Apply mean reversion adjustment if previous price exists
+            if traderObject.get(f"{product}_last_price", None) is not None:
+                last_price = traderObject[f"{product}_last_price"]
                 last_returns = (mmmid_price - last_price) / last_price
-                pred_returns = (
-                    last_returns * self.params[product]["reversion_beta"]
-                )
+                pred_returns = last_returns * self.params[product]["reversion_beta"]
                 fair = mmmid_price + (mmmid_price * pred_returns)
             else:
                 fair = mmmid_price
-            traderObject["starfruit_last_price"] = mmmid_price
+
+            # Save the current mid-price using a product-specific key
+            traderObject[f"{product}_last_price"] = mmmid_price
             return fair
         return None
+
 
     def take_orders(
         self,
@@ -359,6 +369,7 @@ class Trader:
                 if Product.RAINFOREST_RESIN in state.position
                 else 0
             )
+            
             resin_take_orders, buy_order_volume, sell_order_volume = (
                 self.take_orders(
                     Product.RAINFOREST_RESIN,
@@ -403,13 +414,13 @@ class Trader:
                 if Product.KELP in state.position
                 else 0
             )
-            
-            kelp_fair_value = self.get_fair_mid(
-                state.order_depths[Product.KELP],
+
+            kelp_fair_value = self.squid_fair_value(
                 Product.KELP,
+                state.order_depths[Product.KELP],
                 traderObject,
             )
-            
+
             kelp_take_orders, buy_order_volume, sell_order_volume = (
                 self.take_orders(
                     Product.KELP,
@@ -447,19 +458,21 @@ class Trader:
                 kelp_take_orders + kelp_make_orders
             )
             #+ starfruit_clear_orders 
+
+
         if Product.SQUID_INK in self.params and Product.SQUID_INK in state.order_depths:
             squid_ink_position = (
                 state.position[Product.SQUID_INK]
                 if Product.SQUID_INK in state.position
                 else 0
             )
-            
-            squid_ink_fair_value = self.get_fair_mid(
-                state.order_depths[Product.SQUID_INK],
+
+            squid_ink_fair_value = self.squid_fair_value(
                 Product.SQUID_INK,
+                state.order_depths[Product.SQUID_INK],
                 traderObject,
             )
-            
+
             squid_take_orders, buy_order_volume, sell_order_volume = (
                 self.take_orders(
                     Product.SQUID_INK,
@@ -471,34 +484,48 @@ class Trader:
                     self.params[Product.SQUID_INK]["adverse_volume"],
                 )
             )
-            # starfruit_clear_orders, buy_order_volume, sell_order_volume = (
-            #     self.clear_orders(
-            #         Product.STARFRUIT,
-            #         state.order_depths[Product.STARFRUIT],
-            #         starfruit_fair_value,
-            #         self.params[Product.STARFRUIT]["clear_width"],
-            #         starfruit_position,
-            #         buy_order_volume,
-            #         sell_order_volume,
-            #     )
-            # )
+
             squid_ink_make_orders, _, _ = self.make_orders(
-                Product.KELP,
+                Product.SQUID_INK,
                 state.order_depths[Product.SQUID_INK],
-                kelp_fair_value,
-                kelp_position,
+                squid_ink_fair_value,
+                squid_ink_position,
                 buy_order_volume,
                 sell_order_volume,
                 self.params[Product.SQUID_INK]["disregard_edge"],
                 self.params[Product.SQUID_INK]["join_edge"],
                 self.params[Product.SQUID_INK]["default_edge"],
             )
-            result[Product.SQUID_INK] = (
-                squid_take_orders + squid_ink_make_orders
-            )
-            #+ starfruit_clear_orders 
+
+            result[Product.SQUID_INK] = squid_take_orders + squid_ink_make_orders
+
+            # === Z-SCORE MEAN REVERSION STRATEGY ===
+            if len(state.order_depths[Product.SQUID_INK].sell_orders) > 0 and len(state.order_depths[Product.SQUID_INK].buy_orders) > 0:
+                mid_price = self.squid_fair_value(Product.SQUID_INK, state.order_depths[Product.SQUID_INK], traderObject)
+                self.squid_ink_prices.append(mid_price)
+                zscore = self.compute_zscore(self.squid_ink_prices, self.window)
+                position = state.position.get(Product.SQUID_INK, 0)
+                z_orders = []
+
+                if zscore > self.entry_threshold and position > -self.zscore_position_limit:
+                    sell_price = min(state.order_depths[Product.SQUID_INK].sell_orders)
+                    z_orders.append(Order(Product.SQUID_INK, sell_price, -1))
+
+                elif zscore < -self.entry_threshold and position < self.zscore_position_limit:
+                    buy_price = max(state.order_depths[Product.SQUID_INK].buy_orders)
+                    z_orders.append(Order(Product.SQUID_INK, buy_price, 1))
+
+                elif abs(zscore) < self.exit_threshold:
+                    if position > 0:
+                        sell_price = min(state.order_depths[Product.SQUID_INK].sell_orders)
+                        z_orders.append(Order(Product.SQUID_INK, sell_price, -1))
+                    elif position < 0:
+                        buy_price = max(state.order_depths[Product.SQUID_INK].buy_orders)
+                        z_orders.append(Order(Product.SQUID_INK, buy_price, 1))
+
+                result[Product.SQUID_INK] += z_orders
+
 
         conversions = 1
         traderData = jsonpickle.encode(traderObject)
-
         return result, conversions, traderData
